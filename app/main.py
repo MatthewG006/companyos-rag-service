@@ -6,12 +6,22 @@ Endpoints:
 - POST /ingest/companyos  ingest knowledge straight from the CompanyOS DB
 - POST /search            semantic search over ingested chunks
 - POST /ask               RAG: retrieve, then answer with citations
+- POST /ask/jobs          start an ask in the background, returns a job id
+- GET  /ask/jobs/{job_id} poll an ask job (queued -> running -> done/error)
+
+The job endpoints exist so callers behind proxies with a response-wait
+limit never hold one request open for a whole CPU generation: starting a
+job returns immediately and polling is a series of short requests.
 
 When RAG_SERVICE_TOKEN is set, every endpoint except /health requires it
 as a Bearer token — the same owner-token pattern CompanyOS itself uses.
 """
 
 import logging
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -22,6 +32,8 @@ from app.embeddings import build_embedder
 from app.ingest import ingest_documents, read_companyos_documents
 from app.rag import answer_question, build_llm
 from app.schemas import (
+    AskJobCreated,
+    AskJobStatus,
     AskRequest,
     AskResponse,
     CompanyOSIngestResponse,
@@ -162,6 +174,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             question=body.question,
             answer=answer,
             citations=[_to_hit_schema(h) for h in hits],
+        )
+
+    # --- Background ask jobs -------------------------------------------------
+    # In-memory registry: jobs are short-lived polls for a single caller, so
+    # no persistence is needed. Entries expire after _ASK_JOB_TTL_SECONDS.
+    _ASK_JOB_TTL_SECONDS = 15 * 60
+    ask_jobs: dict[str, dict] = {}
+    ask_jobs_lock = threading.Lock()
+    ask_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask-job")
+
+    def _run_ask_job(state, job_id: str, body: AskRequest) -> None:
+        with ask_jobs_lock:
+            if job_id in ask_jobs:
+                ask_jobs[job_id]["status"] = "running"
+        try:
+            answer, hits = answer_question(
+                state.store,
+                state.embedder,
+                state.llm,
+                body.question,
+                body.project_id,
+                body.limit,
+                min_score=state.settings.min_score,
+            )
+        except Exception as exc:  # same surface as the sync endpoint: type name only
+            log.exception("ask job %s failed", job_id)
+            with ask_jobs_lock:
+                if job_id in ask_jobs:
+                    ask_jobs[job_id].update(status="error", error=f"Ask failed: {type(exc).__name__}")
+            return
+        with ask_jobs_lock:
+            if job_id in ask_jobs:
+                ask_jobs[job_id].update(
+                    status="done",
+                    answer=answer,
+                    citations=[_to_hit_schema(h).model_dump() for h in hits],
+                )
+
+    @app.post(
+        "/ask/jobs",
+        response_model=AskJobCreated,
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    def start_ask_job(request: Request, body: AskRequest) -> AskJobCreated:
+        job_id = uuid.uuid4().hex
+        now = time.time()
+        with ask_jobs_lock:
+            stale = [j for j, job in ask_jobs.items() if now - job["created_at"] > _ASK_JOB_TTL_SECONDS]
+            for j in stale:
+                ask_jobs.pop(j, None)
+            ask_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "question": body.question,
+                "answer": None,
+                "citations": None,
+                "error": None,
+                "created_at": now,
+            }
+        ask_executor.submit(_run_ask_job, request.app.state, job_id, body)
+        return AskJobCreated(job_id=job_id, status="queued")
+
+    @app.get("/ask/jobs/{job_id}", response_model=AskJobStatus, dependencies=[Depends(require_auth)])
+    def get_ask_job(job_id: str) -> AskJobStatus:
+        with ask_jobs_lock:
+            job = ask_jobs.get(job_id)
+            snapshot = dict(job) if job is not None else None
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Unknown ask job.")
+        return AskJobStatus(
+            job_id=snapshot["job_id"],
+            status=snapshot["status"],
+            question=snapshot["question"],
+            answer=snapshot["answer"],
+            citations=snapshot["citations"],
+            error=snapshot["error"],
         )
 
     return app

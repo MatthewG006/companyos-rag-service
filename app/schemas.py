@@ -65,6 +65,20 @@ class AskResponse(BaseModel):
     citations: list[SearchHit]
 
 
+class AskJobCreated(BaseModel):
+    job_id: str
+    status: str = Field(description="Always 'queued' at creation; poll the job for progress.")
+
+
+class AskJobStatus(BaseModel):
+    job_id: str
+    status: str = Field(description="One of: queued, running, done, error.")
+    question: str
+    answer: str | None = None
+    citations: list[SearchHit] | None = None
+    error: str | None = None
+
+
 class HealthResponse(BaseModel):
     status: str
     store: str

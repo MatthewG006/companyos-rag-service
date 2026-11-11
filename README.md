@@ -80,6 +80,8 @@ host's Ollama for embeddings and generation.
 | `POST /ingest/companyos` | Ingest knowledge from the CompanyOS database. |
 | `POST /search` | `{query, project_id?, limit}` → ranked chunks with cosine scores. |
 | `POST /ask` | `{question, project_id?, limit}` → grounded answer + citations. |
+| `POST /ask/jobs` | Same body as `/ask`; returns `202 {job_id}` immediately and answers in the background. |
+| `GET /ask/jobs/{job_id}` | Poll a job: `queued` → `running` → `done` (answer + citations) or `error`. |
 
 When `RAG_SERVICE_TOKEN` is set, every endpoint except `/health` requires
 it as a Bearer token — the same owner-token pattern CompanyOS itself uses.
