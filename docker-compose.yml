@@ -40,6 +40,7 @@ services:
       RAG_EMBED_DIM: ${RAG_EMBED_DIM:-768}
       RAG_OLLAMA_BASE_URL: http://host.docker.internal:11434
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
+      RAG_COMPANYOS_DATABASE_URL: ${RAG_COMPANYOS_DATABASE_URL:-}
 
 volumes:
   ragdata:
