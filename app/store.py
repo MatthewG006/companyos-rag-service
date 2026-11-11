@@ -104,9 +104,12 @@ class PgVectorStore:
         self._table = settings.table_name
         self._dim = settings.embed_dim
         self._conn = psycopg.connect(settings.database_url, autocommit=True)
+        with self._conn.cursor() as cur:
+            # The extension must exist before register_vector looks up the
+            # vector type — on a fresh database the order matters.
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         register_vector(self._conn)
         with self._conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._table} (
