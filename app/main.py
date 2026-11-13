@@ -8,6 +8,8 @@ Endpoints:
 - POST /ask               RAG: retrieve, then answer with citations
 - POST /ask/jobs          start an ask in the background, returns a job id
 - GET  /ask/jobs/{job_id} poll an ask job (queued -> running -> done/error)
+- POST /diagnose/jobs     start a mechanic diagnosis of worker health (background)
+- GET  /diagnose/jobs/{job_id} poll a diagnose job
 
 The job endpoints exist so callers behind proxies with a response-wait
 limit never hold one request open for a whole CPU generation: starting a
@@ -28,6 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import Settings, get_settings
+from app.diagnose import diagnose_worker
 from app.embeddings import build_embedder
 from app.ingest import ingest_documents, read_companyos_documents
 from app.rag import answer_question, build_llm
@@ -37,6 +40,9 @@ from app.schemas import (
     AskRequest,
     AskResponse,
     CompanyOSIngestResponse,
+    DiagnoseJobCreated,
+    DiagnoseJobStatus,
+    DiagnoseRequest,
     HealthResponse,
     IngestRequest,
     IngestResponse,
@@ -250,6 +256,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             question=snapshot["question"],
             answer=snapshot["answer"],
             citations=snapshot["citations"],
+            error=snapshot["error"],
+        )
+
+    # --- Background diagnose jobs -------------------------------------------
+    # Same pattern as ask jobs: a diagnosis is a full CPU generation, so it
+    # runs on a background thread and callers poll with short requests.
+    _DIAGNOSE_JOB_TTL_SECONDS = 15 * 60
+    diagnose_jobs: dict[str, dict] = {}
+    diagnose_jobs_lock = threading.Lock()
+    diagnose_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diagnose-job")
+
+    def _run_diagnose_job(state, job_id: str, body: DiagnoseRequest) -> None:
+        with diagnose_jobs_lock:
+            if job_id in diagnose_jobs:
+                diagnose_jobs[job_id]["status"] = "running"
+        try:
+            diagnosis = diagnose_worker(state.llm, body.evidence)
+        except Exception as exc:  # same surface as the other endpoints: type name only
+            log.exception("diagnose job %s failed", job_id)
+            with diagnose_jobs_lock:
+                if job_id in diagnose_jobs:
+                    diagnose_jobs[job_id].update(
+                        status="error", error=f"Diagnose failed: {type(exc).__name__}"
+                    )
+            return
+        with diagnose_jobs_lock:
+            if job_id in diagnose_jobs:
+                diagnose_jobs[job_id].update(status="done", diagnosis=diagnosis)
+
+    @app.post(
+        "/diagnose/jobs",
+        response_model=DiagnoseJobCreated,
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    def start_diagnose_job(request: Request, body: DiagnoseRequest) -> DiagnoseJobCreated:
+        job_id = uuid.uuid4().hex
+        now = time.time()
+        with diagnose_jobs_lock:
+            stale = [
+                j
+                for j, job in diagnose_jobs.items()
+                if now - job["created_at"] > _DIAGNOSE_JOB_TTL_SECONDS
+            ]
+            for j in stale:
+                diagnose_jobs.pop(j, None)
+            diagnose_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "diagnosis": None,
+                "error": None,
+                "created_at": now,
+            }
+        diagnose_executor.submit(_run_diagnose_job, request.app.state, job_id, body)
+        return DiagnoseJobCreated(job_id=job_id, status="queued")
+
+    @app.get(
+        "/diagnose/jobs/{job_id}",
+        response_model=DiagnoseJobStatus,
+        dependencies=[Depends(require_auth)],
+    )
+    def get_diagnose_job(job_id: str) -> DiagnoseJobStatus:
+        with diagnose_jobs_lock:
+            job = diagnose_jobs.get(job_id)
+            snapshot = dict(job) if job is not None else None
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Unknown diagnose job.")
+        return DiagnoseJobStatus(
+            job_id=snapshot["job_id"],
+            status=snapshot["status"],
+            diagnosis=snapshot["diagnosis"],
             error=snapshot["error"],
         )
 
