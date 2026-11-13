@@ -84,3 +84,29 @@ class HealthResponse(BaseModel):
     store: str
     embedder: str
     llm: str
+
+
+class DiagnoseRequest(BaseModel):
+    evidence: dict = Field(description="Worker-health evidence: heartbeat, recent failed runs, queue counts.")
+
+
+class Diagnosis(BaseModel):
+    summary: str
+    likely_cause: str
+    recommended_action: str = Field(
+        description="One of: restart_worker, update_worker, rollback_worker, code_fix, none."
+    )
+    commit: str | None = None
+    rationale: str
+
+
+class DiagnoseJobCreated(BaseModel):
+    job_id: str
+    status: str = Field(description="Always 'queued' at creation; poll the job for progress.")
+
+
+class DiagnoseJobStatus(BaseModel):
+    job_id: str
+    status: str = Field(description="One of: queued, running, done, error.")
+    diagnosis: Diagnosis | None = None
+    error: str | None = None
